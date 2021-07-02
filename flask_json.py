@@ -15,6 +15,7 @@ except ImportError:
     import collections as collections_abc
 from functools import partial, wraps
 from datetime import datetime, date, time
+from json import dumps
 try:
     from speaklater import _LazyString
 # Don't cover since simulated in test_encoder_nospeaklater().
@@ -39,7 +40,7 @@ else:
         return isinstance(value, str)
 
 
-def json_response(status_=200, headers_=None, add_status_=None, data_=None,
+def json_response(status_=200, headers_=None, add_status_=None, data_=None, jsonl=None,
                   **kwargs):
     """Helper function to build JSON response
     with the given HTTP status and fields(``kwargs``).
@@ -104,6 +105,7 @@ def json_response(status_=200, headers_=None, add_status_=None, data_=None,
         `data_`: Data to put in result JSON. It can be used instead of
             ``kwargs`` or if you want to pass non-dictionary value.
         `kwargs`: keyword arguments to put in result JSON.
+        `jsonl`: bool to emit line-based JSON (NDJSON/JSONL)
 
     Returns:
         flask.Response: Response with the JSON content.
@@ -122,7 +124,6 @@ def json_response(status_=200, headers_=None, add_status_=None, data_=None,
        Added ``data_`` and non-dictionary values support.
     """
     assert data_ is None or not kwargs
-
     if isinstance(data_, dict):
         kwargs = data_
         data_ = None
@@ -134,12 +135,17 @@ def json_response(status_=200, headers_=None, add_status_=None, data_=None,
     else:
         add_status = current_app.config['JSON_ADD_STATUS']
 
+    if jsonl is True and add_status is True:
+        # add_status = False
+        raise ValueError('jsonl and add_status kwargs/config setting are mututally exclusive!')
+
     if add_status:
         field = current_app.config['JSON_STATUS_FIELD_NAME']
         if field not in kwargs:
             kwargs[field] = status_
 
-    response = jsonify(data_) if data_ is not None else jsonify(**kwargs)
+    json_fn = ndjsonify if jsonl is True else jsonify
+    response = json_fn(data_) if data_ is not None else json_fn(**kwargs)
     response.status_code = status_
 
     if headers_ is not None:
@@ -164,25 +170,32 @@ def _normalize_view_tuple(tuple_):
 
 # Helper function to create JSON response for the given data.
 # Raises an error if the data is not convertible to JSON.
-def _build_response(data, add_status=None):
+def _build_response(data, add_status=None, jsonl=False):
     if data is None:
-        return json_response(add_status_=add_status)
+        return json_response(add_status_=add_status, jsonl=jsonl)
     elif isinstance(data, dict):
-        return json_response(add_status_=add_status, **data)
+        return json_response(add_status_=add_status, jsonl=jsonl, **data)
     elif isinstance(data, Response):
-        assert 'application/json' in data.mimetype
+        if jsonl is True:
+            # This should go away if the user is allowed to set a custom MIME type
+            ndjson_mimetypes = ('application/x-ndjson', 'application/x-jsonl')
+            assert any([m in data.mimetype for m in ndjson_mimetypes])
+        else:
+            assert 'application/json' in data.mimetype
         return data
     elif isinstance(data, tuple):
         d, status, headers = _normalize_view_tuple(data)
         if isinstance(d, dict):
-            return json_response(status_=status or 200, headers_=headers,
+            if jsonl is True:
+                # Convert to single item list, a questionable default behavior, but meh
+                d = [d]
+            return json_response(status_=status or 200, headers_=headers, jsonl=jsonl,
                                  add_status_=add_status, **d)
         else:
-            return json_response(status_=status or 200, headers_=headers,
+            return json_response(status_=status or 200, headers_=headers, jsonl=jsonl,
                                  add_status_=add_status, data_=d)
     else:
-        return json_response(data_=data)
-        # raise ValueError('Unsupported return value.')
+        return json_response(data_=data, jsonl=jsonl)
 
 
 def as_json(f):
@@ -279,6 +292,36 @@ def _json_p_handler(rv, callbacks=None, optional=None, add_quotes=None):
     return response
 
 
+def _json_l_handler(rv, callbacks=None, optional=None):
+    callbacks = callbacks or current_app.config['JSON_JSONL_QUERY_CALLBACKS']
+    if optional is None:
+        optional = current_app.config['JSON_JSONL_OPTIONAL']
+
+    callback = None
+    for k in callbacks:
+        if k in request.args:
+            callback = request.args.get(k)
+            break
+
+    if callback is None:
+        if optional:
+            return _build_response(rv, add_status=False, jsonl=True)
+        else:
+            raise BadRequest('Missing JSONL callback parameter.')
+
+    data = _build_response(rv, add_status=False, jsonl=True).get_data(as_text=True)
+
+    # This should be in app.config or kwargs
+    if not data.endswith('\n'):  # pragma: no cover
+        data += '\n'
+
+    data = text_type('%s(%s);') % (callback, data)
+
+    response = current_app.response_class(
+        data, status=200, content_type='application/x-ndjson')
+    return response
+
+
 def as_json_p(f=None, callbacks=None, optional=None, add_quotes=None):
     """This decorator acts like :func:`@as_json <flask_json.as_json>` but
     also handles JSONP requests; expects string or any
@@ -356,6 +399,67 @@ def as_json_p(f=None, callbacks=None, optional=None, add_quotes=None):
             rv = f(*args, **kw)
             return _json_p_handler(rv, callbacks, optional, add_quotes)
         return wrapper2
+
+
+def as_json_l(f=None, callbacks=None):
+        """This decorator acts like :func:`@as_json <flask_json.as_json_l>` but
+        also handles JSONL requests; expects string or any
+        :func:`@as_json <flask_json.as_json>` supported return value.
+
+        It may be used in two forms:
+
+        * Without parameters - then global configuration will be applied::
+
+              @as_json_l
+              def view():
+                  ...
+
+        * With parameters - then they will have priority over global ones for the
+          given view::
+
+              @as_json_l(...)
+              def view():
+                  ...
+
+
+        Note:
+            If view returns custom headers or HTTP status then
+            they will be discarded.
+            Also HTTP status field will not be passed to the callback.
+
+        Args:
+            callbacks: List of acceptable callback query parameters.
+
+        Returns:
+            flask.Response: JSONL response
+
+        Raises:
+            ValueError: if return value is not supported.
+            BadRequest: if callback is missing in URL query
+                (if ``optional=False``).
+
+        See Also:
+            :func:`.json_response`,
+            :func:`@as_json <flask_json.as_json>`.
+        """
+        if f is None:
+            def deco(func):
+                @wraps(func)
+                def wrapper(*args, **kw):
+                    rv = func(*args, **kw)
+                    return _json_l_handler(rv, callbacks)
+
+                return wrapper
+
+            return deco
+
+        else:
+            @wraps(f)
+            def wrapper2(*args, **kw):
+                rv = f(*args, **kw)
+                return _json_l_handler(rv, callbacks)
+
+            return wrapper2
 
 
 # TODO: maybe subclass from HTTPException?
@@ -527,6 +631,7 @@ class FlaskJSON(object):
         app.config.setdefault('JSON_ADD_STATUS', True)
         app.config.setdefault('JSON_STATUS_FIELD_NAME', 'status')
         app.config.setdefault('JSON_DECODE_ERROR_MESSAGE', 'Not a JSON.')
+        # This may need to be checked when jsonl=True
         jsonify_errors = app.config.setdefault(
             'JSON_JSONIFY_HTTP_ERRORS', False)
 
@@ -534,6 +639,10 @@ class FlaskJSON(object):
         app.config.setdefault('JSON_JSONP_OPTIONAL', True)
         app.config.setdefault('JSON_JSONP_QUERY_CALLBACKS',
                               ['callback', 'jsonp'])
+
+        app.config.setdefault('JSON_JSONL_OPTIONAL', True)
+        app.config.setdefault('JSON_JSONL_QUERY_CALLBACKS',
+                              ['callback', 'jsonl'])
 
         if not hasattr(app, 'extensions'):
             app.extensions = dict()
@@ -672,3 +781,34 @@ class FlaskJSON(object):
         else:
             self._encoder_class = JSONEncoderWithHook
         return func
+
+
+def ndjsonify(*args, **kwargs):
+    """This is a ripoff of Flask jsonify() which is really just a thing wrapper around a flask.Response factory
+
+    In the NDJSON context, the `indent` kwarg can't be used as that breaks lines
+    The `separators` kwarg can be used
+
+    The `add_newline` keyowrd arg is supported and controls whether a newline will be emitted after
+    the last NDJSON line. It is on by default. This could probably also be controlled by an app.config
+    setting
+    """
+    separators = (',', ':')
+    if current_app.config['JSONIFY_PRETTYPRINT_REGULAR'] or current_app.debug:
+        separators = (', ', ': ')
+    if args and kwargs:
+        raise TypeError('ndjsonify() behavior undefined when passed both args and kwargs')
+    elif len(args) == 1:  # single args are passed directly to dumps()
+        data = args[0]
+    else:
+        data = args or kwargs
+
+    if isinstance(data, dict):
+        data = [data]
+
+    if not isinstance(data, (set, tuple, list)):
+        raise TypeError(f'ndjsonify() behavior undefined when passed anything other than an iterable: {type(data)}')
+
+    return current_app.response_class(
+        '\n'.join([dumps(d, separators=separators) for d in data]) + '\n' if kwargs.get('add_newline', True) else '',
+        mimetype=current_app.config.get('NDJSONIFY_MIMETYPE', 'application/x-ndjson'))
